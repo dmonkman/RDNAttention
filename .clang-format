@@ -1,0 +1,13 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 0
+InsertBraces: true
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+PointerAlignment: Left
+AlwaysBreakTemplateDeclarations: Yes
+SortIncludes: false
+IndentPPDirectives: AfterHash
+PPIndentWidth: 2

@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rdnattention"
+dynamic = ["version"]
+description = "Native HIP FlashAttention-2-style forward attention for AMD RDNA/GCN5 GPUs."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = [
+    "attention",
+    "flashattention",
+    "flash-attention",
+    "transformer",
+    "deep-learning",
+    "gpu",
+    "hip",
+    "rocm",
+    "amd",
+    "rdna",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.11"
+
+# torch is deliberately absent: the ROCm builds do not come from PyPI, so
+# declaring it here would pull the CUDA wheel on top of a working install.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "torch",
+    "pytest>=9.1.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/dmonkman/RDNAttention"
+Repository = "https://github.com/dmonkman/RDNAttention"
+Issues = "https://github.com/dmonkman/RDNAttention/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "rdnattention.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rdnattention*"]
+
+[tool.setuptools.package-data]
+rdnattention = ["lib/*.so", "lib/*.dll"]
