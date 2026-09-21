@@ -1,0 +1,148 @@
+name: Build wheels
+
+on:
+  # Branches only: a v* tag push runs this through publish.yml instead.
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# GitHub-hosted runners have no AMD GPU, so this proves the fat binary builds,
+# packages and loads - not that it computes correctly. The correctness gates
+# still have to be run on real hardware.
+#
+# The toolchain is AMD's pip-installed ROCm, the same distribution users get
+# alongside torch in their venv. Its HIP runtime is still ABI major 7
+# (libamdhip64.so.7 / amdhip64_7.dll), which the wheel links against but does
+# not bundle - it binds to the runtime already in the user's environment.
+env:
+  ROCM_VERSION: "10.0.0"
+  ROCM_INDEX: https://stable.repo.amd.com/rocm/core/whl-next/
+
+jobs:
+  linux:
+    name: Linux wheel
+    runs-on: ubuntu-24.04
+    container:
+      # An old glibc keeps the built .so's symbol versions low; auditwheel
+      # below checks the manylinux tag against what was actually linked.
+      image: ubuntu:22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends g++ ca-certificates
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          activate-environment: true
+
+      - name: Install ROCm and build tools
+        run: |
+          uv pip install cmake ninja build "wheel>=0.43" auditwheel patchelf
+          uv pip install --index-url "$ROCM_INDEX" "rocm[devel]==$ROCM_VERSION"
+          rocm-sdk init
+          echo "HIP_PATH=$(rocm-sdk path --root)" >> "$GITHUB_ENV"
+
+      - name: Build the fat binary
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER="$HIP_PATH/lib/llvm/bin/clang++" \
+            -DCMAKE_HIP_COMPILER="$HIP_PATH/lib/llvm/bin/clang++" \
+            -DCMAKE_PREFIX_PATH="$HIP_PATH"
+          cmake --build build --parallel
+
+      - name: Build wheel
+        run: |
+          # rdnattention/lib/ is gitignored, so it does not exist in a fresh checkout.
+          mkdir -p rdnattention/lib
+          cp build/librdnattention.so rdnattention/lib/
+          python -m build --wheel
+          # setuptools tags this py3-none-any because there are no ext_modules.
+          # It ships a .so, so retag it or the wheel gets served to macOS/ARM.
+          python -m wheel tags --platform-tag linux_x86_64 --remove dist/*.whl
+          # The HIP runtime comes from the user's environment, never the wheel.
+          auditwheel repair --exclude "libamdhip64.so.*" \
+            --plat manylinux_2_28_x86_64 -w wheelhouse dist/*.whl
+          rm -rf dist && mv wheelhouse dist
+
+      - name: Check wheel
+        run: python tests/wheel_check.py dist/*.whl
+
+      - name: Smoke test the installed wheel
+        # Run from outside the checkout so the import resolves to the
+        # installed package and its bundled library, not the source tree.
+        run: |
+          uv pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          python -c "import rdnattention as r; print(r.__file__); r._lib_handle(); print('has_device:', r.has_device())"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          path: dist/*.whl
+          if-no-files-found: error
+
+      - name: Resource audit
+        # Last, so a failure here still leaves the wheel inspectable.
+        run: python tests/head_dim_resources.py
+
+  windows:
+    name: Windows wheel
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          activate-environment: true
+
+      - name: Install ROCm and build tools
+        run: |
+          uv pip install cmake ninja build "wheel>=0.43"
+          uv pip install --index-url "$ROCM_INDEX" "rocm[devel]==$ROCM_VERSION"
+          rocm-sdk init
+          echo "HIP_PATH=$(cygpath -m "$(rocm-sdk path --root)")" >> "$GITHUB_ENV"
+
+      - name: Build the fat binary
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER="$HIP_PATH/lib/llvm/bin/clang++.exe" \
+            -DCMAKE_HIP_COMPILER="$HIP_PATH/lib/llvm/bin/clang++.exe" \
+            -DCMAKE_PREFIX_PATH="$HIP_PATH"
+          cmake --build build --parallel
+
+      - name: Build wheel
+        run: |
+          mkdir -p rdnattention/lib
+          cp build/rdnattention.dll rdnattention/lib/
+          python -m build --wheel
+          python -m wheel tags --platform-tag win_amd64 --remove dist/*.whl
+
+      - name: Check wheel
+        run: python tests/wheel_check.py dist/*.whl
+
+      - name: Smoke test the installed wheel
+        # No AMD driver on the runner: this proves the DLL and its HIP runtime
+        # import resolve, and has_device() is expected to report False.
+        run: |
+          uv pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          python -c "import rdnattention as r; print(r.__file__); r._lib_handle(); print('has_device:', r.has_device())"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows
+          path: dist/*.whl
+          if-no-files-found: error

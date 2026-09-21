@@ -75,6 +75,15 @@ def _find_library() -> Path:
 
 
 def _load_library(path: Path):
+    # pip-installed ROCm (rocm-sdk-core) keeps amdhip64 inside site-packages,
+    # off every loader search path. Preloading it by path is what torch does,
+    # and makes this library bind to the same runtime torch uses.
+    try:
+        import rocm_sdk
+        rocm_sdk.preload_libraries("amdhip64")
+    except ImportError:
+        pass
+
     # Windows: amdhip64_*.dll is only found if already resident (torch imported
     # first) or its directory was added explicitly - PATH is not consulted.
     try:

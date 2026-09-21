@@ -14,65 +14,13 @@ on:
 permissions:
   contents: read
 
-env:
-  # Must exist on Docker Hub - check https://hub.docker.com/r/rocm/dev-ubuntu-22.04/tags
-  # before changing. Ubuntu 22.04 is glibc 2.35, which fixes MANYLINUX_TAG below;
-  # moving to a 24.04 image means manylinux_2_39_x86_64.
-  ROCM_IMAGE: rocm/dev-ubuntu-22.04:6.4-complete
-  MANYLINUX_TAG: manylinux_2_35_x86_64
-
 jobs:
-  linux-wheel:
-    name: Linux wheel (Tier 1 fat binary)
-    runs-on: ubuntu-24.04
-    container:
-      image: rocm/dev-ubuntu-22.04:6.4-complete
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build tools
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            cmake ninja-build git python3-pip python3-venv
-
-      - name: Build the fat binary
-        run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --parallel
-
-      - name: Resource audit
-        # Needs hipcc but no GPU, so it is the only gate that can run here.
-        # The two correctness gates need a real device - run them on hardware.
-        run: python3 tests/head_dim_resources.py
-
-      - name: Stage the library into the package
-        # rdnattention/lib/ is gitignored, so it does not exist in a fresh checkout.
-        run: |
-          mkdir -p rdnattention/lib
-          cp build/librdnattention.so rdnattention/lib/
-
-      - name: Build wheel
-        run: |
-          python3 -m venv /tmp/bev
-          /tmp/bev/bin/pip install --upgrade pip build "wheel>=0.43"
-          /tmp/bev/bin/python -m build --wheel
-          # setuptools tags this py3-none-any because there are no ext_modules.
-          # It ships a .so, so retag it or the wheel gets served to macOS/ARM.
-          /tmp/bev/bin/python -m wheel tags \
-            --python-tag py3 --abi-tag none --platform-tag "$MANYLINUX_TAG" \
-            --remove dist/*.whl
-          ls -la dist/
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheel-linux
-          path: dist/*.whl
-          if-no-files-found: error
+  build:
+    uses: ./.github/workflows/build.yml
 
   publish:
     name: Publish to ${{ inputs.repository || 'pypi' }}
-    needs: [linux-wheel]
+    needs: [build]
     runs-on: ubuntu-latest
     environment: ${{ inputs.repository || 'pypi' }}
     permissions:
