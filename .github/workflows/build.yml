@@ -94,12 +94,16 @@ jobs:
           if-no-files-found: error
 
       - name: Resource audit
-        # Last, so a failure here still leaves the wheel inspectable.
         run: python tests/head_dim_resources.py
 
   windows:
     name: Windows wheel
-    runs-on: windows-2025
+    # windows-2025 ships Visual Studio 2026 (MSVC 14.51), whose <cmath> declares
+    # isgreater() and friends in a way ROCm 10.0's clang HIP headers reject
+    # ("__device__ function 'isgreater' cannot overload __host__ __device__
+    # function"). windows-2022 has VS 2022's MSVC 14.44, which works; the
+    # "Select MSVC 14.44" step pins it and fails if it is missing.
+    runs-on: windows-2022
     defaults:
       run:
         shell: bash
@@ -118,17 +122,26 @@ jobs:
           rocm-sdk init
           echo "HIP_PATH=$(cygpath -m "$(rocm-sdk path --root)")" >> "$GITHUB_ENV"
 
+      - name: Select MSVC 14.44
+        # clang takes the MSVC headers and libs from VCToolsInstallDir when it
+        # is set, instead of picking the newest toolset it can find.
+        shell: pwsh
+        run: |
+          $vc = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\14.44.*' -Directory |
+                Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $vc) { throw "MSVC 14.44 not found on this runner" }
+          "VCToolsInstallDir=$($vc.FullName)\" >> $env:GITHUB_ENV
+          Write-Host "Using $($vc.FullName)"
+
       - name: Build the fat binary
         # CMAKE_HIP_COMPILER_ROCM_ROOT is set because, when CMake cannot
         # identify the HIP compiler, it falls back to `hipconfig --rocmpath`,
-        # which prints backslashes that CMake then writes into
-        # CMakeHIPCompiler.cmake unescaped ("Invalid character escape '\a'" on
-        # a D:\a\... runner path).
+        # whose backslashes it writes into CMakeHIPCompiler.cmake unescaped.
+        # That fails with "Invalid character escape" and hides the real error.
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER="$HIP_PATH/lib/llvm/bin/clang++.exe" \
             -DCMAKE_HIP_COMPILER="$HIP_PATH/lib/llvm/bin/clang++.exe" \
-            -DCMAKE_HIP_PLATFORM=amd \
             -DCMAKE_HIP_COMPILER_ROCM_ROOT="$HIP_PATH" \
             -DCMAKE_PREFIX_PATH="$HIP_PATH"
           cmake --build build --parallel

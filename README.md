@@ -140,6 +140,13 @@ var selects which ROCm install CMake finds - keep the compiler and headers from 
 same version. Python 3.11+ and a ROCm build of torch are needed only for the Python
 bindings.
 
+On Windows, build with MSVC 14.44 (Visual Studio 2022). ROCm 10.0's clang rejects
+the `<cmath>` in Visual Studio 2026's MSVC 14.5x (`__device__ function 'isgreater'
+cannot overload __host__ __device__ function`). clang uses the newest MSVC it finds,
+so with both installed, point it at 14.44 by setting `VCToolsInstallDir` to that
+toolset's directory, e.g.
+`C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\`.
+
 ```
 cmake -S . -B build
 cmake --build build
