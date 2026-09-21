@@ -9,6 +9,7 @@
   <a href="#overview">Overview</a> |
   <a href="#features">Features</a> |
   <a href="#supported-hardware">Hardware</a> |
+  <a href="#install">Install</a> |
   <a href="#build">Build</a> |
   <a href="#quick-start">Quick Start</a> |
   <a href="docs/api.md">API Reference</a>
@@ -111,6 +112,27 @@ does, so a lower tier costs speed and not precision.
 [`FEATURES.md`](FEATURES.md) has the full per-GPU instruction matrix and the tiering;
 [`docs/hardware.md`](docs/hardware.md) has the per-architecture resource budgets.
 
+## Install
+
+```
+pip install rdnattention
+```
+
+There is one wheel per platform - Linux x86_64 (glibc 2.28+) and Windows x64 - and
+each covers every Python from 3.11 up, since the package is pure Python over a
+`ctypes`-loaded library.
+
+The wheels are built with ROCm 10.0.0 (AMD's pip-installed `rocm[devel]`) and link the
+HIP 7 runtime, `libamdhip64.so.7` / `amdhip64_7.dll`, without bundling it. They work
+in any environment that provides HIP 7 - tested against ROCm 7.2 and 10.0. The
+runtime is taken from the pip-installed ROCm that a ROCm build of torch brings
+along, falling back to `HIP_PATH` on Windows or the system library path on Linux.
+Install torch first; its ROCm builds do not come from PyPI, so `rdnattention` does
+not declare it as a dependency.
+
+The wheels cover the [Tier 1](#tier-1---both-kernels-native-dot-product-alus)
+targets. Anything else needs a source build.
+
 ## Build
 
 Requirements: C++20, CMake >= 3.21, and a ROCm install with HIP. The `HIP_PATH` env
@@ -186,7 +208,7 @@ Two more checks in the same spirit - the resource audit needs no GPU at all, onl
 `hipcc`:
 
 ```
-python tests/head_dim_resources.py     # fails on any VGPR spill
+python tests/head_dim_resources.py     # fails on any VGPR spill beyond its allowance
 python tests/head_dim.py               # 144 cases: 16 head_dims x 9 variants
 ```
 

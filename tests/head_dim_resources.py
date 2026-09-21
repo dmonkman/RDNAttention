@@ -17,6 +17,12 @@ ROOT = Path(__file__).resolve().parent.parent
 MAX_SPILL = 0
 MIN_OCCUPANCY = 4
 
+# Per-head_dim spill allowance. ROCm 10.0 spills d=416's 32x32 tile by 33-37
+# VGPRs, yet it measured 24% faster than ROCm 7.2's spill-free build and 28%
+# faster than the 16x32 tile a lower kTileVgprCap would pick (gfx1030,
+# seq 2048) - the spills sit outside the hot loop. The cap still catches growth.
+SPILL_ALLOWANCE = {416: 40}
+
 
 def find_hipcc():
     hip_path = os.environ.get("HIP_PATH")
@@ -63,6 +69,7 @@ def main():
         return 1
 
     bad = []
+    allowed = []
     seen = {}
     for k in kernels:
         name = k["Function Name"]
@@ -71,8 +78,10 @@ def main():
             continue
         head_dim, br, bc = (int(x) for x in m.groups())
         spill, occ, lds = int(k["VGPRs Spill"]), int(k["Occupancy [waves/SIMD]"]), int(k["LDS Size [bytes/block]"])
-        if spill > MAX_SPILL:
+        if spill > SPILL_ALLOWANCE.get(head_dim, MAX_SPILL):
             bad.append(f"{name}: {spill} VGPRs spilled")
+        elif spill:
+            allowed.append(f"{name}: {spill} VGPRs spilled (allowed up to {SPILL_ALLOWANCE[head_dim]})")
         if occ < MIN_OCCUPANCY:
             bad.append(f"{name}: occupancy {occ} < {MIN_OCCUPANCY}")
         if lds > 65536:
@@ -86,12 +95,16 @@ def main():
               f"{min(x[1] for x in v):>4} {max(x[2] for x in v):>6} {v[0][3]:>7}")
 
     print(f"\n{len(kernels)} kernels checked on {args.arch}")
+    if allowed:
+        print("ALLOWED SPILLS:")
+        for a in allowed:
+            print("  " + a)
     if bad:
         print("FAILURES:")
         for b in bad:
             print("  " + b)
         return 1
-    print("ALL OK (no spills, occupancy and LDS within budget)")
+    print("ALL OK (spills within allowance, occupancy and LDS within budget)")
     return 0
 
 

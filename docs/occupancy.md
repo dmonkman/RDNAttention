@@ -110,11 +110,29 @@ Open leads, none benchmarked yet.
 - **Both walls at once.** Every fp16 tile at head_dim >= 96 is pinned at 4
   waves by VGPRs and LDS together. Six waves needs <= 160 VGPRs *and*
   <= 43,690 B; cutting either alone buys nothing.
-- **ROCm 10.0 regressions.** head_dim 416 now spills, which fails
-  `tests/head_dim_resources.py` and so the CI wheel build. 448 went 226 -> 254,
-  two VGPRs from the ceiling; 352 went 211 -> 231; INT8 d=64 128x64 lost two
-  waves as above. Elsewhere 10.0 mostly uses fewer VGPRs, by 10-22 at
+- **ROCm 10.0 regressions.** 448 went 226 -> 254, two VGPRs from the
+  ceiling, and measured ~6% slower than under 7.2; 352 went 211 -> 231; INT8
+  d=64 128x64 lost two waves as above. Elsewhere 10.0 mostly uses fewer VGPRs, by 10-22 at
   head_dim 160-320.
+
+## The head_dim 416 spill is kept on purpose
+
+Under ROCm 10.0, head_dim 416's 32x32 tile spills 33-37 VGPRs. It sits
+exactly on `kTileVgprCap` (52 accumulator + 32 staged-V VGPRs = 84), so a cap
+of 83 would move it - and only it - to 16x32 with no spill. Measured instead
+(`hip_bench headdim`, b1 h8 seq 2048 non-causal, 6 interleaved rounds, spread
+under 1%):
+
+| head_dim 416 | TFLOP/s |
+|---|---|
+| ROCm 7.2, 32x32, no spill | 6.73 |
+| **ROCm 10.0, 32x32, spilling** | **8.35** |
+| ROCm 10.0, 16x32 (cap 83), no spill | 6.51 |
+
+The spilling build is the fastest, so the spills evidently sit outside the
+hot loop. `tests/head_dim_resources.py` allows up to 40 spilled VGPRs for
+head_dim 416 and still fails beyond that. Only one shape was measured;
+causal and longer sequences are unchecked.
 
 ## Reproduce
 

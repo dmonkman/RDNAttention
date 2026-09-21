@@ -72,6 +72,9 @@ jobs:
           auditwheel repair --exclude "libamdhip64.so.*" \
             --plat manylinux_2_28_x86_64 -w wheelhouse dist/*.whl
           rm -rf dist && mv wheelhouse dist
+          # auditwheel also adds the older manylinux1 / 2_5 tags it qualifies
+          # for; no ROCm runs on glibc that old, so keep the one tag that matters.
+          python -m wheel tags --platform-tag manylinux_2_28_x86_64 --remove dist/*.whl
 
       - name: Check wheel
         run: python tests/wheel_check.py dist/*.whl
@@ -116,12 +119,26 @@ jobs:
           echo "HIP_PATH=$(cygpath -m "$(rocm-sdk path --root)")" >> "$GITHUB_ENV"
 
       - name: Build the fat binary
+        # CMAKE_HIP_COMPILER_ROCM_ROOT is set because, when CMake cannot
+        # identify the HIP compiler, it falls back to `hipconfig --rocmpath`,
+        # which prints backslashes that CMake then writes into
+        # CMakeHIPCompiler.cmake unescaped ("Invalid character escape '\a'" on
+        # a D:\a\... runner path).
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER="$HIP_PATH/lib/llvm/bin/clang++.exe" \
             -DCMAKE_HIP_COMPILER="$HIP_PATH/lib/llvm/bin/clang++.exe" \
+            -DCMAKE_HIP_PLATFORM=amd \
+            -DCMAKE_HIP_COMPILER_ROCM_ROOT="$HIP_PATH" \
             -DCMAKE_PREFIX_PATH="$HIP_PATH"
           cmake --build build --parallel
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: cmake-configure-log-windows
+          path: build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
 
       - name: Build wheel
         run: |
