@@ -6,6 +6,7 @@
 
 #include "rdna/fa2_forward_f16.hpp"
 #include "rdna/fa2_forward_int8qk.hpp"
+#include "rdna/monarch_forward_f16.hpp"
 
 #include <array>
 #include <cstdio>
@@ -49,7 +50,13 @@ RDNA_API int32_t rdna_attention_forward(
     int32_t causal,
     int32_t has_rope,
     int32_t window_size,
+    uint32_t null_keys,
     void* hip_stream) {
+    if (null_keys != 0 && (causal != 0 || window_size >= 0)) {
+        setError("%s", "null_keys is not valid with causal or windowed attention: both "
+                       "mask by key position, which the dropped keys no longer have");
+        return -2;
+    }
     rdna::ForwardParams p{};
     p.q = q;
     p.k = k;
@@ -79,6 +86,7 @@ RDNA_API int32_t rdna_attention_forward(
     p.causal = causal != 0 ? 1u : 0u;
     p.hasRope = has_rope != 0 ? 1u : 0u;
     p.windowSize = window_size;
+    p.nullKeys = null_keys;
 
     int rc = rdna::forwardF16(p, hip_stream);
     if (rc != 0) {
@@ -192,4 +200,55 @@ RDNA_API int32_t rdna_attention_forward_int8qk(
     }
     return 0;
 #endif
+}
+
+RDNA_API uint64_t rdna_monarch_workspace_bytes(
+    uint32_t batch_size,
+    uint32_t num_heads,
+    uint32_t seq_len,
+    uint32_t head_dim) {
+    rdna::MonarchParams p{};
+    p.batchSize = batch_size;
+    p.numHeads = num_heads;
+    p.seqLen = seq_len;
+    p.headDim = head_dim;
+    return static_cast<uint64_t>(rdna::monarchWorkspaceBytes(p));
+}
+
+RDNA_API int32_t rdna_attention_forward_monarch(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* output,
+    void* workspace,
+    uint32_t batch_size,
+    uint32_t num_heads,
+    uint32_t seq_len,
+    uint32_t head_dim,
+    uint32_t block_b,
+    float scale,
+    void* hip_stream) {
+    if (workspace == nullptr) {
+        setError("Attention (monarch) failed: %s", "workspace is null");
+        return -2;
+    }
+    rdna::MonarchParams p{};
+    p.q = q;
+    p.k = k;
+    p.v = v;
+    p.o = output;
+    p.workspace = workspace;
+    p.batchSize = batch_size;
+    p.numHeads = num_heads;
+    p.seqLen = seq_len;
+    p.headDim = head_dim;
+    p.blockB = block_b;
+    p.scale = scale;
+
+    int rc = rdna::monarchForwardF16(p, hip_stream);
+    if (rc != 0) {
+        setError("Attention (monarch) failed: %s", rdna::monarchLastError());
+        return -4;
+    }
+    return 0;
 }

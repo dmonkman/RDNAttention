@@ -34,14 +34,15 @@ Under ROCm, torch still spells the device `"cuda"`.
 
 ## Tensor contract
 
-Every entry point takes the same layout.
+Every entry point takes the same shape. They differ in how strided a tensor
+they accept.
 
 | Rule | Value |
 |---|---|
 | Shape | `[batch, heads, seq_len, head_dim]` |
-| Layout | contiguous (call `.contiguous()` first) |
+| Layout | `flash_attn`: `head_dim` contiguous, batch/head/seq strided as you like. Every other entry point: fully contiguous (call `.contiguous()` first). |
 | Device | a HIP device |
-| Returns | a new tensor, same shape as `query` |
+| Returns | a new tensor, same shape as `query` - and for `flash_attn`, its layout |
 
 Key and value carry their own head and sequence counts, so grouped-query and
 cross-attention need no extra arguments:
@@ -55,7 +56,7 @@ There is no backward pass. Nothing here participates in autograd.
 
 ## Functions
 
-### `flash_attn(query, key, value, is_causal=False, window_size=-1, rot_cos=None, rot_sin=None)`
+### `flash_attn(query, key, value, is_causal=False, window_size=-1, rot_cos=None, rot_sin=None, null_keys=0)`
 
 FlashAttention-2 style forward attention in fp16.
 
@@ -65,8 +66,22 @@ FlashAttention-2 style forward attention in fp16.
 | `is_causal` | `bool` |
 | `window_size` | `int`, negative disables |
 | `rot_cos`, `rot_sin` | `float32` angle tables, or `None` |
+| `null_keys` | `int`, count of all-zero keys the caller dropped |
 
 Returns `float16`.
+
+`null_keys` lets a caller drop all-zero keys instead of passing them. A zero
+key scores 0 against every query, so it takes softmax weight while
+contributing no value - dropping it outright changes the result, but declaring
+how many were dropped does not, because the kernel returns exactly that weight
+to the denominator. Zero-padded cross-attention context is the case this
+exists for: a 512-key context holding 102 real keys runs 3.35x faster passed
+as 102 keys with `null_keys=410`. The compensation is exact - it reproduces an
+fp64 reference to 9.4e-16 - but the two paths reach the denominator by
+different accumulations, so in fp16 they agree to rounding (measured 2.4e-04
+on real captures) rather than bit-for-bit. Rejected
+alongside `is_causal` and `window_size`, which mask by key position - a
+position the dropped keys no longer have.
 
 Pass `rot_cos` and `rot_sin` together to apply rotary embeddings to Q and K
 inside the kernel, with no separate pass over the tensors. Both are contiguous
@@ -191,9 +206,9 @@ except RDNAttentionError as e:
     ...
 ```
 
-Common causes: no HIP device, an unsupported head_dim, a non-contiguous input,
-a dtype other than the one that entry point takes, or a query head count that
-is not a multiple of the key head count.
+Common causes: no HIP device, an unsupported head_dim, a layout the entry point
+cannot stride over, a dtype other than the one that entry point takes, or a
+query head count that is not a multiple of the key head count.
 
 ## Limits
 

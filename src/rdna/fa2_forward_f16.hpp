@@ -33,6 +33,12 @@ struct ForwardParams {
     uint32_t causal = 0;
     uint32_t hasRope = 0;
     int32_t windowSize = -1; // < 0 = full attention
+    /// All-zero keys the caller dropped instead of passing. They carry no
+    /// value, but a zero key still scores 0 against every query, so they hold
+    /// weight in the softmax denominator that the epilogue has to add back.
+    /// Rejected alongside causal/window, whose masking is defined against key
+    /// positions that no longer exist once those keys are gone.
+    uint32_t nullKeys = 0;
 };
 
 /// Launches the forward kernel on `stream`. Non-blocking. 0 on success.

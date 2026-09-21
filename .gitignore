@@ -5,6 +5,10 @@
 tmp
 logs
 
+# Monarch testing data
+.data
+.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

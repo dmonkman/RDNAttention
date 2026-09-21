@@ -30,6 +30,11 @@ RDNA_API const char* rdna_get_error();
 /// across batch and heads; pass nullptr for both to skip RoPE. num_kv_heads < num_heads
 /// selects the GQA path. window_size < 0 means full attention.
 ///
+/// null_keys counts all-zero keys the caller dropped rather than passed. A
+/// zero key scores 0 against every query, so it holds softmax weight without
+/// contributing any value; the kernel adds that weight back to the
+/// denominator. Not valid with causal or windowed attention.
+///
 /// hip_stream is a hipStream_t cast to void* - the launch is enqueued on it
 /// and does not block the host. Returns 0 on success, nonzero (with
 /// rdna_get_error() detail) on an unsupported head_dim or a launch failure.
@@ -54,6 +59,49 @@ RDNA_API int32_t rdna_attention_forward(
     int32_t causal,
     int32_t has_rope,
     int32_t window_size,
+    uint32_t null_keys,
+    void* hip_stream);
+
+// ============================================================================
+// MonarchAttention forward, T=1 (src/rdna/monarch_forward_f16.hip).
+//
+// APPROXIMATE: the output is the Monarch projection of softmax attention, not
+// softmax attention. Sub-quadratic - Theta(N*sqrt(N)*d) rather than
+// Theta(N^2*d) - and measured at 17-36x the fp16 kernel's throughput on
+// gfx1030, at a rel_rms around 0.13-0.16 against exact attention.
+//
+// Q/K/V/output are contiguous _Float16 [batch, heads, seq_len, head_dim] -
+// no strides, self-attention only (there is no key_seq_len: the algorithm has
+// no Nq/Nk distinction). head_dim is 64 or 128. block_b need only divide
+// seq_len - partial tiles are masked, so awkward video grids like WAN's
+// 5544 = 308 x 18 work, just less efficiently than a multiple of 64.
+//
+// block_b is the contiguous block size. It is NOT free: it must align to the
+// token grid, or accuracy collapses. Callers that know the (f,h,w) layout
+// should derive it; callers that do not should not use this path.
+// ============================================================================
+
+/// Bytes of device scratch rdna_attention_forward_monarch() needs. The library
+/// never allocates - the caller owns this buffer and may reuse one across
+/// calls and layers.
+RDNA_API uint64_t rdna_monarch_workspace_bytes(
+    uint32_t batch_size,
+    uint32_t num_heads,
+    uint32_t seq_len,
+    uint32_t head_dim);
+
+RDNA_API int32_t rdna_attention_forward_monarch(
+    const void* q,
+    const void* k,
+    const void* v,
+    void* output,
+    void* workspace,
+    uint32_t batch_size,
+    uint32_t num_heads,
+    uint32_t seq_len,
+    uint32_t head_dim,
+    uint32_t block_b,
+    float scale,
     void* hip_stream);
 
 // ============================================================================

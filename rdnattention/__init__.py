@@ -28,6 +28,7 @@ _lib = None
 
 SUPPORTED_HEAD_DIMS = tuple(range(32, 513, 32))
 SUPPORTED_HEAD_DIMS_INT8 = (64, 128)
+SUPPORTED_HEAD_DIMS_MONARCH = (64, 128)
 
 
 class RDNAttentionError(Exception):
@@ -109,6 +110,7 @@ def _lib_handle():
             ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_float, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_uint32,
             ctypes.c_void_p,
         ]
         lib.rdna_attention_forward.restype = ctypes.c_int32
@@ -126,6 +128,18 @@ def _lib_handle():
             ctypes.c_void_p,
         ]
         lib.rdna_attention_forward_int8qk.restype = ctypes.c_int32
+        lib.rdna_monarch_workspace_bytes.argtypes = [
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ]
+        lib.rdna_monarch_workspace_bytes.restype = ctypes.c_uint64
+        lib.rdna_attention_forward_monarch.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_float,
+            ctypes.c_void_p,
+        ]
+        lib.rdna_attention_forward_monarch.restype = ctypes.c_int32
         _lib = lib
     return _lib
 
@@ -135,7 +149,11 @@ def has_device() -> bool:
     return _lib_handle().rdna_has_device() == 1
 
 
-def _validate_inputs(query, key, value, expected_dtype) -> None:
+def _validate_inputs(query, key, value, expected_dtype, strided_ok=False) -> None:
+    # strided_ok is per-entry-point rather than the default because only the
+    # kernels whose C entry point takes per-axis strides can walk a strided
+    # tensor. rdna_attention_forward_monarch takes bare pointers, so relaxing
+    # this for it would read the wrong rows instead of failing.
     import torch
 
     if not isinstance(query, torch.Tensor):
@@ -147,7 +165,11 @@ def _validate_inputs(query, key, value, expected_dtype) -> None:
             raise ValueError(f"{name} must be {expected_dtype}, got {t.dtype}")
         if t.dim() != 4:
             raise ValueError(f"{name} must be 4D [batch, heads, seq, head_dim], got shape {tuple(t.shape)}")
-        if not t.is_contiguous():
+        if strided_ok:
+            if t.stride(-1) != 1:
+                raise ValueError(f"{name} needs a contiguous head_dim axis, got stride "
+                                 f"{t.stride(-1)} - call .contiguous() first")
+        elif not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous - call .contiguous() first")
     if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
         raise ValueError(f"Batch size must match: Q={query.shape}, K={key.shape}, V={value.shape}")
@@ -193,10 +215,13 @@ def _rope_ptrs(rot_cos, rot_sin, query, seq_len, key_seq_len, head_dim):
 
 
 def flash_attn(query, key, value, is_causal: bool = False, window_size: int = -1,
-               rot_cos=None, rot_sin=None):
-    """FlashAttention-2-style forward. query/key/value: contiguous float16
+               rot_cos=None, rot_sin=None, null_keys: int = 0):
+    """FlashAttention-2-style forward. query/key/value: float16
     [batch, heads, seq, head_dim] on a HIP device, head_dim in
-    SUPPORTED_HEAD_DIMS. key/value may have fewer heads than query (GQA), as
+    SUPPORTED_HEAD_DIMS. Only head_dim has to be contiguous - batch, head and
+    seq are indexed by stride, so a [batch, seq, heads, head_dim] tensor
+    transposed to BHSD goes in without a copy and the result comes back in
+    that same layout. key/value may have fewer heads than query (GQA), as
     an exact divisor. Returns a new tensor shaped like query.
 
     Pass rot_cos and rot_sin together to apply rotary embeddings to Q and K
@@ -204,12 +229,24 @@ def flash_attn(query, key, value, is_causal: bool = False, window_size: int = -1
     [max(seq_len, key_seq_len), head_dim // 2], shared across batch and heads,
     indexed by position within the tensor starting at row 0.
 
+    null_keys counts all-zero keys dropped instead of passed. A zero key
+    scores 0 against every query, so it takes softmax weight while adding no
+    value; the kernel returns that weight to the denominator, making the
+    result identical to having passed the zeros - which is what lets a caller
+    trim zero-padded cross-attention context. Not supported with is_causal or
+    window_size, which mask by key position.
+
     Only head_dim 64 and 128 have tuned tile sizes.
     """
     import torch
 
-    _validate_inputs(query, key, value, torch.float16)
+    _validate_inputs(query, key, value, torch.float16, strided_ok=True)
     _check_head_dim(query.shape[-1], "flash_attn")
+    if null_keys < 0:
+        raise ValueError(f"null_keys must be >= 0, got {null_keys}")
+    if null_keys and (is_causal or window_size >= 0):
+        raise ValueError("null_keys is not supported with causal or windowed attention: "
+                         "both mask by key position, which the dropped keys no longer have")
     if not has_device():
         raise RDNAttentionError("no usable HIP device found")
 
@@ -230,7 +267,7 @@ def flash_attn(query, key, value, is_causal: bool = False, window_size: int = -1
         vs[0], vs[1], vs[2],
         os_[0], os_[1], os_[2],
         batch, heads, kv_heads, seq_len, key_seq_len, head_dim,
-        scale, 1 if is_causal else 0, has_rope, window_size,
+        scale, 1 if is_causal else 0, has_rope, window_size, null_keys,
         torch.cuda.current_stream().cuda_stream,
     )
     if result != 0:
@@ -357,7 +394,71 @@ def flash_attn_int8qk_quantized(query, key, value, is_causal: bool = False,
     return (out.float() * v_channel.unsqueeze(-2)).to(out.dtype)
 
 
+_monarch_workspace = {}
+
+
+def _monarch_ws(device, nbytes: int):
+    """One reusable scratch buffer per device - the workspace is transient, so
+    every layer and every step can share it."""
+    import torch
+
+    key = str(device)
+    buf = _monarch_workspace.get(key)
+    if buf is None or buf.numel() < nbytes:
+        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        _monarch_workspace[key] = buf
+    return buf
+
+
+def flash_attn_monarch(query, key, value, block_b: int, scale: float = None):
+    """MonarchAttention forward, one refinement step (T=1).
+
+    APPROXIMATE - returns the Monarch projection of softmax attention, not
+    softmax attention. Sub-quadratic, and measured at 17-36x flash_attn()'s
+    throughput on gfx1030 at rel_rms ~0.13-0.16 against exact attention.
+
+    Self-attention only: query/key/value are contiguous float16
+    [batch, heads, seq, head_dim] with the same seq on all three, head_dim in
+    SUPPORTED_HEAD_DIMS_MONARCH. block_b need only divide seq; partial tiles
+    are masked, so awkward video grids work, just less efficiently than a
+    multiple of 64.
+
+    block_b is the contiguous block size and is not a free parameter - it must
+    align to the token grid or the approximation collapses (a misaligned split
+    measures ~6x worse). Derive it from the model's (f, h, w) layout.
+    """
+    import torch
+
+    _validate_inputs(query, key, value, torch.float16)
+    batch, heads, seq_len, head_dim = query.shape
+    _check_head_dim(head_dim, "flash_attn_monarch", allowed=SUPPORTED_HEAD_DIMS_MONARCH)
+    if key.shape != query.shape or value.shape != query.shape:
+        raise ValueError(
+            "flash_attn_monarch is self-attention only: query/key/value must have "
+            f"identical shapes, got Q={tuple(query.shape)} K={tuple(key.shape)} "
+            f"V={tuple(value.shape)}")
+    if block_b <= 0 or seq_len % block_b:
+        raise ValueError(f"block_b {block_b} must divide seq_len {seq_len}")
+    lib = _lib_handle()
+    nbytes = int(lib.rdna_monarch_workspace_bytes(batch, heads, seq_len, head_dim))
+    ws = _monarch_ws(query.device, nbytes)
+    out = torch.empty_like(query)
+    if scale is None:
+        scale = 1.0 / (head_dim ** 0.5)
+
+    rc = lib.rdna_attention_forward_monarch(
+        ctypes.c_void_p(query.data_ptr()), ctypes.c_void_p(key.data_ptr()),
+        ctypes.c_void_p(value.data_ptr()), ctypes.c_void_p(out.data_ptr()),
+        ctypes.c_void_p(ws.data_ptr()),
+        batch, heads, seq_len, head_dim, block_b, ctypes.c_float(scale),
+        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
+    if rc != 0:
+        raise RDNAttentionError(lib.rdna_get_error().decode("utf-8", "replace"))
+    return out
+
+
 __all__ = ["flash_attn", "flash_attn_int8qk", "flash_attn_int8qk_quantized",
-           "quantize_int8_perchannel_v", "quantize_int8_qk_pertoken",
-           "has_device", "RDNAttentionError", "SUPPORTED_HEAD_DIMS",
-           "SUPPORTED_HEAD_DIMS_INT8", "__version__"]
+           "flash_attn_monarch", "quantize_int8_perchannel_v",
+           "quantize_int8_qk_pertoken", "has_device", "RDNAttentionError",
+           "SUPPORTED_HEAD_DIMS", "SUPPORTED_HEAD_DIMS_INT8",
+           "SUPPORTED_HEAD_DIMS_MONARCH", "__version__"]

@@ -101,7 +101,23 @@ struct KernelParams {
     float scale;
     uint32_t hasRope;
     int32_t windowSize; // <= 0: no window
+    uint32_t nullKeys;
 };
+
+/// Reciprocal of the softmax denominator, scaling acco on the way out.
+/// Dropped null keys scored exactly 0 and carried no value, so they add
+/// nullKeys * exp2(-m) to the denominator and nothing to acco. Renormalising
+/// to max(rm, 0) keeps both terms finite when every real logit is negative,
+/// and returns 0 rather than NaN when rm is still the sentinel.
+__device__ inline float softmaxInv(float rl, float rm, uint32_t nullKeys) {
+    if (nullKeys == 0) {
+        return rl > 0.0f ? 1.0f / rl : 0.0f;
+    }
+    const float m = fmaxf(rm, 0.0f);
+    const float corr = exp2f(rm - m);
+    const float denom = rl * corr + (float)nullKeys * exp2f(-m);
+    return denom > 0.0f ? corr / denom : 0.0f;
+}
 
 constexpr int kLdsBudget = 65536;
 
@@ -730,7 +746,7 @@ __global__ __launch_bounds__(256) void forwardKernel(KernelParams p) {
             continue;
         }
         int qq = gQq[i];
-        float inv = rl[i] > 0.0f ? 1.0f / rl[i] : 0.0f;
+        float inv = softmaxInv(rl[i], rm[i], p.nullKeys);
         _Float16* oRow = p.o + oRow0 + qq * p.oStrideS;
         #pragma unroll
         for (int e = 0; e < DPT; e++) {
@@ -865,7 +881,7 @@ __global__ __launch_bounds__(256) void forwardKernelGqa(KernelParams p) {
                 continue;
             }
             int qq = gQq[i];
-            float inv = rl[g][i] > 0.0f ? 1.0f / rl[g][i] : 0.0f;
+            float inv = softmaxInv(rl[g][i], rm[g][i], p.nullKeys);
             _Float16* oRow = p.o + oRow0[g] + qq * p.oStrideS;
             #pragma unroll
             for (int e = 0; e < DPT; e++) {
@@ -917,6 +933,7 @@ bool makeKernelParams(const ForwardParams& params, KernelParams& kp) {
     kp.scale = params.scale;
     kp.hasRope = params.hasRope;
     kp.windowSize = params.windowSize;
+    kp.nullKeys = params.nullKeys;
     return true;
 }
 

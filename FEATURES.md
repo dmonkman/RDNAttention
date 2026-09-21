@@ -186,6 +186,7 @@ Forward pass only, both kernels - `src/rdna/fa2_forward_f16.hip` (fp16) and
 | head_dim | 32-512, any multiple of 32¹ | 64, 128 |
 | Cross-attention / decode (seq_len != key_seq_len) | ✅ | ✅ |
 | Arbitrary strides (non-contiguous batch/head) | ✅ | ✅ |
+| Dropped all-zero keys (`null_keys`, exact denominator compensation) | ✅ | ❌ |
 | Per-token Q/K quantization scales | n/a | ✅ (`qScaleVec`/`kScaleVec`) |
 | Per-channel V quantization scale | n/a | ✅ (exact, host-side) |
 | Per-token V quantization scale | n/a | ❌ (the scale sits inside the PV sum) |
@@ -199,7 +200,19 @@ The two kernels now cover the same shape surface; what still separates them is
 numeric, not structural. Use `flash_attn_int8qk_quantized()` rather than the
 raw kernel defaults - it applies per-token Q/K and per-channel V, worth a
 measured 3.75x (0.0349 -> 0.0093 worst-case rel_rms on real captures).
-INT8's remaining gaps are RoPE and a per-token V scale.
+INT8's remaining gaps are RoPE, `null_keys`, and a per-token V scale.
+
+`null_keys` lets a caller drop all-zero keys and declare how many went, rather
+than passing them. A zero key scores 0 against every query, so it carries no
+value but still takes a share of the softmax denominator - dropping it outright
+changes the result, declaring it does not. Zero-padded cross-attention context
+is what it exists for: a 512-key context holding 102 real keys runs 3.35x
+faster as 102 keys plus `null_keys=410`. The compensation is exact against an
+fp64 reference (9.4e-16); in fp16 the two paths accumulate the denominator
+differently and so agree to rounding (2.4e-04 measured on real captures), not
+bit-for-bit. It is refused
+alongside causal and windowed attention, which mask by a key position the
+dropped keys no longer have.
 
 ## Not yet implemented
 
