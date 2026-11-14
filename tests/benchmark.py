@@ -18,10 +18,13 @@ from pathlib import Path
 from typing import Optional
 
 RDNATTENTION_ROOT = Path(__file__).resolve().parent.parent
+RESULTS_MD = RDNATTENTION_ROOT / "benchmark_result.md"
 sys.path.insert(0, str(RDNATTENTION_ROOT))
 
 try:
     import torch
+    import torch.nn.functional as F
+    from torch.nn.attention.bias import causal_lower_right
 except ImportError:
     print("This script needs a ROCm PyTorch install - not one of rdnattention's own "
           "dependencies. Run it from an environment that has one.")
@@ -60,9 +63,16 @@ CAUSAL_MODES = [False, True]
 # seq=2048. Re-check peak memory before raising this.
 MAX_ROCBLAS_NAIVE_BATCH = 4
 
+# SDPA on gfx1030 only has the math backend, which upcasts to fp32 and keeps
+# several score-sized buffers: measured ~10.4 B per (batch, head, q, k) element,
+# 1.4GB at batch=1, seq=2048. Overcommitting VRAM here can take down the PC,
+# so rows whose estimate exceeds the budget are skipped.
+SDPA_BYTES_PER_SCORE = 12
+SDPA_MAX_BYTES = 6e9
+
 CAUSAL = False  # set per-iteration by run()
 
-BASE_COLUMNS = ["rocBLAS (naive)", "Fable FP16", "FP16 (native HIP)", "INT8 (native HIP)"]
+BASE_COLUMNS = ["rocBLAS (naive)", "PyTorch SDPA", "Fable FP16", "FP16 (native HIP)", "INT8 (native HIP)"]
 
 COLUMNS = list(BASE_COLUMNS)
 
@@ -133,6 +143,42 @@ def bench_rocblas_naive(batch, seq_len, key_seq_len, head_dim, kv_heads,
     start = time.perf_counter()
     for _ in range(num_runs):
         forward()
+    torch.cuda.synchronize()
+    avg_ms = (time.perf_counter() - start) / num_runs * 1000
+
+    tflops = ops_count(batch, NUM_HEADS, seq_len, key_seq_len, head_dim) / (avg_ms / 1000) / 1e12
+    mb = torch.cuda.max_memory_allocated() / 1e6
+    return Result(avg_ms, tflops, mb)
+
+
+def sdpa_causal_mask(seq_len, key_seq_len, causal):
+    """SDPA's is_causal aligns the mask top-left; everything else here aligns
+    it bottom-right (a decode query sees its whole cache)."""
+    return causal_lower_right(seq_len, key_seq_len) if causal else None
+
+
+def bench_sdpa(batch, seq_len, key_seq_len, head_dim, kv_heads,
+                num_warmup=NUM_WARMUP, num_runs=NUM_RUNS) -> Optional[Result]:
+    """torch's default SDPA dispatch - what a stock model gets on this card.
+    None when the score-matrix estimate is over SDPA_MAX_BYTES."""
+    if batch * NUM_HEADS * seq_len * key_seq_len * SDPA_BYTES_PER_SCORE > SDPA_MAX_BYTES:
+        return None
+    q_shape = (batch, NUM_HEADS, seq_len, head_dim)
+    kv_shape = (batch, kv_heads, key_seq_len, head_dim)
+    q = torch.randn(q_shape, device="cuda", dtype=torch.float16)
+    k = torch.randn(kv_shape, device="cuda", dtype=torch.float16)
+    v = torch.randn(kv_shape, device="cuda", dtype=torch.float16)
+    gqa = kv_heads != NUM_HEADS
+    mask = sdpa_causal_mask(seq_len, key_seq_len, CAUSAL)
+
+    for _ in range(num_warmup):
+        F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=gqa)
+    torch.cuda.synchronize()
+
+    torch.cuda.reset_peak_memory_stats()
+    start = time.perf_counter()
+    for _ in range(num_runs):
+        F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=gqa)
     torch.cuda.synchronize()
     avg_ms = (time.perf_counter() - start) / num_runs * 1000
 
@@ -241,7 +287,7 @@ class _ForcedPathLib:
         fn.restype = ctypes.c_int32
         fn.argtypes = ([ctypes.c_void_p] * 6 + [ctypes.c_int64] * 12 +
                        [ctypes.c_uint32] * 6 + [ctypes.c_float] +
-                       [ctypes.c_int32] * 3 + [ctypes.c_void_p])
+                       [ctypes.c_int32] * 3 + [ctypes.c_uint32, ctypes.c_void_p])
         self._fn = fn
         self._ctypes = ctypes
 
@@ -257,7 +303,7 @@ class _ForcedPathLib:
             v.stride(0), v.stride(1), v.stride(2),
             out.stride(0), out.stride(1), out.stride(2),
             batch, heads, k.shape[1], seq_len, k.shape[2], head_dim,
-            head_dim ** -0.5, 1 if is_causal else 0, 0, -1, None)
+            head_dim ** -0.5, 1 if is_causal else 0, 0, -1, 0, None)
         if rc != 0:
             raise RuntimeError(f"rdna_attention_forward returned {rc}")
         return out
@@ -326,6 +372,13 @@ def collect_row(head_dim, batch, seq_len, key_seq_len, kv_heads):
     except Exception as e:
         print(f"  {tag} rocBLAS (naive) error: {e}")
         results["rocBLAS (naive)"] = None
+
+    try:
+        results["PyTorch SDPA"] = bench_sdpa(batch, seq_len, key_seq_len, head_dim, kv_heads)
+    except Exception as e:
+        print(f"  {tag} PyTorch SDPA error: {e}")
+        results["PyTorch SDPA"] = None
+        torch.cuda.empty_cache()
 
     try:
         results["Fable FP16"] = bench_fable(batch, seq_len, key_seq_len, head_dim, kv_heads)
@@ -423,6 +476,13 @@ def accuracy_row(head_dim, kv_heads_full, seq_len, key_seq_len, causal):
     except Exception as e:
         print(f"  accuracy rocBLAS (naive) error: {e}")
 
+    try:
+        errors["PyTorch SDPA"] = rel_rms(F.scaled_dot_product_attention(
+            q, k, v, attn_mask=sdpa_causal_mask(seq_len, key_seq_len, causal),
+            enable_gqa=ratio != 1), ref)
+    except Exception as e:
+        print(f"  accuracy PyTorch SDPA error: {e}")
+
     # Fable expects (batch, seqlen, nheads, headdim); transpose in and back.
     try:
         got = fable_attn.flash_attn_func(
@@ -496,7 +556,58 @@ def print_table(title, rows, field, fmt):
         print(id_cells + "".join(cells))
 
 
-def run(with_tiers=True):
+def write_results_md(rows, acc_rows, elapsed, notes):
+    """The same tables as the console output, as Markdown. Only a full default
+    run writes this, so the file never holds a partial sweep."""
+    import subprocess
+    try:
+        commit = subprocess.run(["git", "describe", "--always", "--dirty"], cwd=RDNATTENTION_ROOT,
+                                capture_output=True, text=True).stdout.strip() or "unknown"
+    except OSError:
+        commit = "unknown"
+
+    def table(title, id_cols, cols, body):
+        out = [f"## {title}", "", "| " + " | ".join(id_cols + cols) + " |",
+               "|" + "---|" * (len(id_cols) + len(cols))]
+        out += ["| " + " | ".join(cells) + " |" for cells in body]
+        return out + [""]
+
+    def timing_body(field, fmt):
+        for head_dim, batch, kv_heads, seq_len, key_seq_len, causal, results in rows:
+            ids = [str(head_dim), str(batch), str(kv_heads), str(seq_len), str(key_seq_len), str(causal)]
+            yield ids + [format(getattr(results[c], field), fmt) if results.get(c) is not None else "n/a"
+                         for c in COLUMNS]
+
+    def accuracy_body():
+        for head_dim, kv_heads, seq_len, key_seq_len, causal, errors in acc_rows:
+            ids = [str(head_dim), str(kv_heads), str(seq_len), str(key_seq_len), str(causal)]
+            yield ids + [f"{errors[c]:.3e}" if errors.get(c) is not None else "n/a"
+                         for c in ACCURACY_COLUMNS]
+
+    timing_ids = ["d", "B", "kvH", "seq", "kseq", "causal"]
+    lines = [
+        "# Benchmark results",
+        "",
+        "Generated by `python tests/benchmark.py` (full default run, no flags); do not edit by hand.",
+        "",
+        f"- Date: {time.strftime('%Y-%m-%d %H:%M')}",
+        f"- Commit: `{commit}`",
+        f"- Device: {torch.cuda.get_device_name(0)}",
+        f"- torch {torch.__version__}, HIP {torch.version.hip}",
+        f"- H={NUM_HEADS}, warmup={NUM_WARMUP}, runs={NUM_RUNS}, wall time {elapsed:.1f}s",
+        "",
+    ]
+    lines += table("OPS (TFLOP/s for FP16 columns, TOP/s for INT8 columns)",
+                   timing_ids, COLUMNS, timing_body("ops", ".2f"))
+    lines += table("Time (ms)", timing_ids, COLUMNS, timing_body("ms", ".3f"))
+    lines += table("Memory (MB)", timing_ids, COLUMNS, timing_body("mb", ".1f"))
+    lines += table("Accuracy (rel_rms vs fp64 reference; lower is better)",
+                   ["d", "kvH", "seq", "kseq", "causal"], ACCURACY_COLUMNS, accuracy_body())
+    lines += ["## Notes", ""] + [f"- {n}" for n in notes] + [""]
+    RESULTS_MD.write_text("\n".join(lines), encoding="utf-8")
+
+
+def run(with_tiers=True, write_results=False):
     global CAUSAL, COLUMNS, ACCURACY_COLUMNS
 
     if not rdnattention.has_device():
@@ -551,16 +662,25 @@ def run(with_tiers=True):
           f"heads={ACCURACY_HEADS} (GQA ratio preserved).")
 
     print(f"\nTotal wall time for this run: {script_elapsed:.2f}s")
-    print(f"kvH = key/value heads (< {NUM_HEADS} is GQA); seq/kseq = query/key length "
-          f"(unequal is cross-attention/decode).")
-    print(f"rocBLAS (naive): unfused matmul->softmax->matmul, skipped above batch="
-          f"{MAX_ROCBLAS_NAIVE_BATCH}. Fable FP16: fable_attn. FP16/INT8 (native HIP): "
-          f"rdnattention.flash_attn() and flash_attn_int8qk().")
-    print("INT8 +per-chan V (accuracy only): flash_attn_int8qk_quantized().")
-    print("Accuracy: rel_rms against an fp64 reference on identical inputs.")
+    notes = [
+        f"kvH = key/value heads (< {NUM_HEADS} is GQA); seq/kseq = query/key length "
+        f"(unequal is cross-attention/decode).",
+        f"rocBLAS (naive): unfused matmul->softmax->matmul, skipped above batch="
+        f"{MAX_ROCBLAS_NAIVE_BATCH}. PyTorch SDPA: F.scaled_dot_product_attention, default "
+        f"backend dispatch, skipped over ~{SDPA_MAX_BYTES / 1e9:.0f}GB estimated. Fable FP16: fable_attn. FP16/INT8 (native HIP): "
+        f"rdnattention.flash_attn() and flash_attn_int8qk().",
+        "INT8 +per-chan V (accuracy only): flash_attn_int8qk_quantized().",
+        "Accuracy: rel_rms against an fp64 reference on identical inputs.",
+    ]
     if any(c in COLUMNS for c in TIER_COLUMNS):
-        print("Tier2/Tier3: the same kernel with fdot2() forced to those lowerings - the cost of "
-              "losing v_dot2 on this card, not a prediction for Tier 2/3 silicon.")
+        notes.append("Tier2/Tier3: the same kernel with fdot2() forced to those lowerings - the cost of "
+                     "losing v_dot2 on this card, not a prediction for Tier 2/3 silicon.")
+    for note in notes:
+        print(note)
+
+    if write_results:
+        write_results_md(rows, acc_rows, script_elapsed, notes)
+        print(f"\nWrote {RESULTS_MD}")
 
 
 def int_list(text):
@@ -666,7 +786,9 @@ one KV cache, and -s 512,1024 -ks 512,1024 is all four combinations.""")
     if args.causal:
         CAUSAL_MODES = args.causal
 
-    run(with_tiers=not args.no_tiers)
+    # Any flag narrows the sweep, so only a flag-free run is a full benchmark.
+    full_run = not any(vars(args).values())
+    run(with_tiers=not args.no_tiers, write_results=full_run)
 
 
 if __name__ == "__main__":
